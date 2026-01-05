@@ -662,11 +662,18 @@ static int init_pkvm_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu,
 {
 	int ret = 0;
 	u32 mp_state;
+	struct kvm_hyp_req *hyp_reqs;
 
 	if (hyp_pin_shared_mem(host_vcpu, host_vcpu + 1))
 		return -EBUSY;
 
-	hyp_vcpu->vcpu.arch.hyp_reqs = kern_hyp_va(host_vcpu->arch.hyp_reqs);
+	hyp_reqs = READ_ONCE(host_vcpu->arch.hyp_reqs);
+	if (!PAGE_ALIGNED(hyp_reqs)) {
+		hyp_unpin_shared_mem(host_vcpu, host_vcpu + 1);
+		return -EINVAL;
+	}
+
+	hyp_vcpu->vcpu.arch.hyp_reqs = kern_hyp_va(hyp_reqs);
 	if (hyp_pin_shared_mem(hyp_vcpu->vcpu.arch.hyp_reqs,
 			       hyp_vcpu->vcpu.arch.hyp_reqs + 1)) {
 		hyp_unpin_shared_mem(host_vcpu, host_vcpu + 1);
@@ -702,16 +709,13 @@ static int init_pkvm_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu,
 	if (ret)
 		goto done;
 
-	ret = pkvm_vcpu_init_psci(hyp_vcpu);
-	if (ret)
-		goto done;
-
 	if (test_bit(KVM_ARM_VCPU_SVE, hyp_vcpu->vcpu.arch.features)) {
 		ret = init_pkvm_hyp_vcpu_sve(hyp_vcpu, host_vcpu);
 		if (ret)
 			goto done;
 	}
 
+	WARN_ON(pkvm_vcpu_init_psci(hyp_vcpu));
 	pkvm_vcpu_init_traps(hyp_vcpu);
 	kvm_reset_pvm_sys_regs(&hyp_vcpu->vcpu);
 done:
@@ -832,6 +836,8 @@ int __pkvm_init_vm(struct kvm *host_kvm, unsigned long pgd_hva)
 
 	ret = -EINVAL;
 	pgd_size = kvm_pgtable_stage2_pgd_size(host_mmu.arch.vtcr);
+	if (!IS_ALIGNED(pgd_hva, pgd_size))
+		goto err_free_last_ran;
 	pgd = map_donated_memory_noclear(pgd_hva, pgd_size);
 	if (!pgd)
 		goto err_free_last_ran;
@@ -1588,9 +1594,19 @@ static bool pkvm_memrelinquish_call(struct pkvm_hyp_vcpu *hyp_vcpu,
 		goto out_guest_err;
 
 	ret = __pkvm_guest_relinquish_to_host(hyp_vcpu, ipa, &pa);
-	if (ret == -ENOMEM) {
-		if (pkvm_handle_empty_memcache(hyp_vcpu, exit_code))
+	if (ret == -E2BIG) {
+		struct kvm_hyp_req *req = pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_REQ_TYPE_SPLIT);
+
+		if (!req) {
+			ret = -ENOMEM;
 			goto out_guest_err;
+		}
+
+		req->split.guest_ipa = ALIGN_DOWN(ipa, PMD_SIZE);
+		req->split.size = PMD_SIZE;
+
+		write_sysreg_el2(read_sysreg_el2(SYS_ELR) - 4, SYS_ELR);
+		*exit_code = ARM_EXCEPTION_HYP_REQ;
 
 		return false;
 	} else if (ret) {
